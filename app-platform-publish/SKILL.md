@@ -5,7 +5,10 @@ description: Publish a website or app to DigitalOcean App Platform and return it
 
 # Publish to App Platform
 
-Flow: **build and test in the sandbox → make it deployable → push to GitHub → create the App Platform app → wait for ACTIVE → check the URL.**
+Flow: **build and test in the sandbox → make it deployable → propose the plan and get a yes → push to GitHub → create the App Platform app → wait for ACTIVE → check the URL.**
+
+**Never create a repo, push, or create/update/delete an app before the user has approved the plan in step 2.** A request like
+"publish it" is not that approval. Building and testing in the sandbox needs no approval.
 
 Never use `apps` action `publish`, `docker`, or `doctl` — none of them work on this computer. Everything goes through
 two shared credentials, which you call via the core's credential broker. You never see the tokens.
@@ -27,7 +30,8 @@ wget, unzip. Parse JSON with `node -e` or `python3 -c`.
 | `github` | `api.github.com` | GET/POST/PATCH under `/user` and `/repos/jnaidu-do` |
 | `github-git` | `github.com` (git push/clone) | GET/POST under `/jnaidu-do/` |
 
-Everything is created under the GitHub account `jnaidu-do`. A `403 path_not_allowed` / `method_not_allowed` means the
+Everything is created under the shared GitHub account `jnaidu-do` (a deployment-wide credential, not the user's own).
+Say this in the plan. If the user wants their own account, tell them that is not set up yet. A `403 path_not_allowed` / `method_not_allowed` means the
 request is outside that — do not try variations; tell the user it is not permitted.
 
 ### Broker helper
@@ -80,9 +84,30 @@ Add `"databases": [{"name":"db","engine":"PG","production":false,"version":"16"}
 first connection for ~30 s: the database can still be starting. Only add a database if the app really needs one (it
 costs extra).
 
-## 2. Push to GitHub
+## 2. Propose the plan and ask (stop here until they say yes)
 
-Pick a repo name `qm-<short-kebab-name>` (lowercase). If the name is taken (422), add a short suffix.
+Once the app builds and runs locally, **stop and send the user a short plan, then wait for a reply.** Do not run any
+`bk` call, `git push`, or repo/app creation until they approve. Include:
+
+1. **What you built** and that it ran locally (one line).
+2. **The steps you will take**, in order, each with what it touches:
+   - Create GitHub repo `jnaidu-do/<name>` — **public**, on the shared `jnaidu-do` account (not the user's own account)
+   - Push the app's files to it with git (list what is included; confirm no secrets)
+   - Create App Platform app `<name>` in region `nyc`: a static site (no charge for a few) or a service
+     (`basic-xxs`, about $5/month) — say which, and the cost
+   - Wait for the build (3–5 min), then give them the public URL
+3. **What becomes public:** the repo and the live site are readable by anyone on the internet.
+4. **What you will not do** without asking again: push further changes, edit the spec, or delete anything.
+
+End with a direct question, e.g. "Should I create the repo and app as above? You can also change the name, make the repo
+private (that needs the DO GitHub App granted), or say no." Offer alternatives if relevant (static vs service, different
+name). If they decline, give them the files or the repo-ready code and stop.
+
+Ask again, separately, before: any later `git push` (updates), changing the app spec, and deleting the app.
+
+## 3. Push to GitHub
+
+Use the name you proposed in step 2 (`qm-<short-kebab-name>`) (lowercase). If the name is taken (422), add a short suffix.
 
 ```bash
 # create the repo (public: App Platform can then clone it without extra auth)
@@ -95,10 +120,10 @@ git remote add origin "$AGENT_API_URL/v1/credentials/git/github-git/jnaidu-do/qm
 git -c http.extraHeader="x-agent-capability: $AGENT_CREDENTIAL_TOKEN" push origin HEAD:refs/heads/main
 ```
 
-Later updates: commit and push the same way (`HEAD:refs/heads/main`). The user asking you to publish is the approval
-to create the repo and the app; ask only before deleting anything.
+Later updates: commit and push the same way (`HEAD:refs/heads/main`), but only after telling the user what changed and
+getting a yes — every push is a new approval, not covered by the first plan.
 
-## 3. Create the App Platform app
+## 4. Create the App Platform app
 
 ```bash
 bk digitalocean POST https://api.digitalocean.com/v2/apps '{"spec": {
@@ -129,7 +154,7 @@ done; retry the same request. If they cannot, fall back to a generic public clon
 (`"git": {"repo_clone_url": "https://github.com/jnaidu-do/qm-hello-site.git", "branch": "main"}`) and tell them
 updates then need a redeploy (see below).
 
-## 4. Wait for ACTIVE
+## 5. Wait for ACTIVE
 
 A real build takes 3–5 minutes. Poll every 30 s, and tell the user you are waiting:
 
@@ -140,13 +165,15 @@ bk digitalocean GET "https://api.digitalocean.com/v2/apps/$APP_ID/deployments?pe
 Phases: `PENDING_BUILD` → `BUILDING` → `DEPLOYING` → `ACTIVE`. `ERROR` or `CANCELED` means it failed; go to
 "When it fails". Stop polling after about 12 minutes and tell the user where it stands.
 
-## 5. Report the URL
+## 6. Report the URL
 
 ```bash
 bk digitalocean GET "https://api.digitalocean.com/v2/apps/$APP_ID" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).app.live_url))'
 ```
 
-`curl -s -o /dev/null -w '%{http_code}' <live_url>` — expect 200. Give the user the full `https://…ondigitalocean.app`
+Try `curl -s -o /dev/null -w '%{http_code}' <live_url>` — expect 200. **This computer often cannot reach new
+`*.ondigitalocean.app` sites** (connection fails). If curl fails but the deployment is ACTIVE, that is not a deploy
+failure: say you could not verify from here and ask the user to open the URL. Give the user the full `https://…ondigitalocean.app`
 URL and the repo URL. The app is **public** on the internet.
 
 ## When it fails
@@ -169,11 +196,13 @@ bk digitalocean GET "https://api.digitalocean.com/v2/apps/$APP_ID/deployments/$D
 | Vite "Blocked request. This host is not allowed" | set `preview: { allowedHosts: true }` (or serve the built `dist` as a static site) |
 | Build "skipped" / ACTIVE in seconds | the source did not change; push a real commit |
 
-Fix the code, commit and push (`deploy_on_push` redeploys automatically), then poll again. For a spec change, send
+Tell the user the root cause (the exact log line) and the fix you propose, and **ask before pushing the fix or changing
+the spec** — each push and each spec change needs its own yes. After they approve, fix the code, commit and push
+(`deploy_on_push` redeploys automatically), then poll again. For a spec change, send
 `PUT /v2/apps/$APP_ID` with `{"spec": {...}}` (get the current spec first with `GET /v2/apps/$APP_ID` and edit it).
 For a generic `git` source, force a rebuild with `POST /v2/apps/$APP_ID/deployments` body `{"force_build":true}`.
 Do not delete and recreate the app to fix a failure — that changes the URL. Fix forward. Give up after three
-different failed attempts and report what you tried.
+different failed attempts and report what you tried. Reading logs needs no approval.
 
 ## Deleting
 
